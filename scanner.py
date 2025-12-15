@@ -1,4 +1,4 @@
-# IDM, Cartographer 3D, and OpenBedScanner Script v4.3.0 w/ Temperature Compensation and Cartgorapher Survey
+# IDM, Cartographer 3D, and OpenBedScanner Script v3.0.0 w/ Temperature Compensation and Cartgorapher Survey
 #
 # To buy affordable bed scanners, check out https://cartographer3d.com
 #
@@ -241,7 +241,7 @@ class Scanner:
             raise self.printer.command_error(
                 "Please change detect_threshold_z to scanner_touch_threshold in printer.cfg"
             )
-        self.detect_threshold_z: int = self.scanner_touch_config["threshold"]  # pyright: ignore[reportUnknownMemberType]
+        self.detect_threshold_z = self.scanner_touch_config["threshold"]
         self.previous_probe_success = None
 
         self.cal_config = {
@@ -311,6 +311,17 @@ class Scanner:
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler(
             "klippy:mcu_identify", self._handle_mcu_identify
+        )
+        mcu_name = self._mcu.get_name() if hasattr(self._mcu, 'get_name') else self.name
+        disconnect_event = "non_critical_mcu_%s:disconnected" % mcu_name
+        reconnect_event = "non_critical_mcu_%s:reconnected" % mcu_name
+        self.printer.register_event_handler(
+            disconnect_event,
+            self._handle_mcu_disconnect
+        )
+        self.printer.register_event_handler(
+            reconnect_event,
+            self._handle_mcu_reconnect
         )
         self._mcu.register_config_callback(self._build_config)
         self._mcu.register_response(
@@ -461,6 +472,7 @@ class Scanner:
         manual_z_offset = gcmd.get_float(
             "Z_OFFSET", self.scanner_touch_config["z_offset"], minval=0
         )
+
         # Debugging information
         self.log_debug_info(
             vars["verbose"],
@@ -498,7 +510,7 @@ class Scanner:
         self.toolhead.wait_moves()
 
         curtime = self.printer.get_reactor().monotonic()
-        kinematics = self.kinematics
+        kinematics = self.toolhead.get_kinematics()
         kin_status = kinematics.get_status(curtime)
         if "x" not in kin_status["homed_axes"] or "y" not in kin_status["homed_axes"]:
             self.trigger_method = TriggerMethod.SCAN
@@ -560,7 +572,7 @@ class Scanner:
 
             result = self.start_touch(gcmd, touch_settings, vars["verbose"])
 
-            max_deviation = result["max_deviation"]
+            standard_deviation = result["standard_deviation"]
             final_position = result["final_position"]
             retries = result["retries"]
             success = result["success"]
@@ -576,7 +588,7 @@ class Scanner:
                 self.log_debug_info(
                     vars["verbose"],
                     gcmd,
-                    f"Maximum Deviation: {max_deviation:.4f}",
+                    f"Standard Deviation: {standard_deviation:.4f}",
                 )
                 if calibrate == 1:
                     self._calibrate(
@@ -592,7 +604,7 @@ class Scanner:
 
     # Event handlers
     def start_touch(self, gcmd: GCodeCommand, touch_settings, verbose: bool):
-        kinematics = self.kinematics
+        kinematics = self.toolhead.get_kinematics()
         initial_position = touch_settings.initial_position
         homing_position = touch_settings.homing_position
         accel = touch_settings.accel
@@ -609,17 +621,11 @@ class Scanner:
         randomize = touch_settings.randomize
 
         original_threshold = self.detect_threshold_z
-        deviation = None
         try:
             self.detect_threshold_z = test_threshold
             # Set the initial position for the toolhead
-            try:
-                self.toolhead.set_position(initial_position, homing_axes=[2, "z"])
-            except Exception:
-                try:
-                    self.toolhead.set_position(initial_position, homing_axes="z")
-                except Exception:
-                    self.toolhead.set_position(initial_position, homing_axes=[2])
+            self.toolhead.set_position(initial_position, homing_axes=[2])
+
             retries = 0
 
             new_retry = False
@@ -628,13 +634,6 @@ class Scanner:
             original_position = initial_position[:]
 
             while len(samples) < num_samples:
-                if retries >= max_retries:
-                    self.detect_threshold_z = original_threshold
-                    self.trigger_method = TriggerMethod.SCAN
-                    self._zhop()
-                    raise gcmd.error(
-                        f"Exceeded maximum attempts [{retries}/{int(max_retries)}]"
-                    )
                 if randomize > 0 and new_retry:
                     # Generate random offsets
                     x_offset = random.uniform(-randomize, randomize)
@@ -661,7 +660,6 @@ class Scanner:
                     )
                 except self.printer.command_error as e:
                     if self.printer.is_shutdown():
-                        self.detect_threshold_z = original_threshold
                         self.trigger_method = TriggerMethod.SCAN
                         raise self.printer.command_error(
                             "Touch procedure interrupted due to printer shutdown"
@@ -687,6 +685,12 @@ class Scanner:
 
                 deviation = round(deviation, 4)
                 if deviation > tolerance:
+                    if retries >= max_retries:
+                        self.trigger_method = TriggerMethod.SCAN
+                        self._zhop()
+                        raise gcmd.error(
+                            f"Exceeded maximum attempts [{retries}/{int(max_retries)}]"
+                        )
                     self.log_debug_info(
                         verbose,
                         gcmd,
@@ -705,50 +709,45 @@ class Scanner:
                     f"Deviation: {deviation:.4f}\nNew Average: {average:.4f}\nTolerance: {tolerance:.4f}",
                 )
 
-            if len(samples) == num_samples and deviation <= tolerance:
-                gcmd.respond_info(
-                    f"Completed {len(samples)} touches with a max deviation of {deviation:.4f}"
-                )
-                position_difference = (
-                    initial_position[2] - self.toolhead.get_position()[2]
-                )
-                adjusted_difference = initial_position[2] - np.mean(samples)
-                self.log_debug_info(
-                    verbose,
-                    gcmd,
-                    f"Position Difference: {position_difference:.4f}\nAdjusted Difference: {adjusted_difference:.4f}",
-                )
+            std_dev = np.std(samples)
+            gcmd.respond_info(
+                f"Completed {len(samples)} touches with a standard deviation of {std_dev:.4f}"
+            )
+            position_difference = initial_position[2] - self.toolhead.get_position()[2]
+            adjusted_difference = initial_position[2] - np.mean(samples)
+            self.log_debug_info(
+                verbose,
+                gcmd,
+                f"Position Difference: {position_difference:.4f}\nAdjusted Difference: {adjusted_difference:.4f}",
+            )
 
-                initial_position[2] = float(adjusted_difference - position_difference)
-                formatted_position = [f"{coord:.2f}" for coord in initial_position]
-                self.log_debug_info(
-                    verbose, gcmd, f"Updated Initial Position: {formatted_position}"
-                )
-                if manual_z_offset > 0:
-                    gcmd.respond_info(f"Offsetting by {manual_z_offset:.3f}")
-                    initial_position[2] = initial_position[2] - manual_z_offset
-                self.toolhead.set_position(initial_position)
-                self.toolhead.wait_moves()
-                self.toolhead.flush_step_generation()
-                self.trigger_method = TriggerMethod.SCAN
-                self.previous_probe_success = 1
+            initial_position[2] = float(adjusted_difference - position_difference)
+            formatted_position = [f"{coord:.2f}" for coord in initial_position]
+            self.log_debug_info(
+                verbose, gcmd, f"Updated Initial Position: {formatted_position}"
+            )
+            if manual_z_offset > 0:
+                gcmd.respond_info(f"Offsetting by {manual_z_offset:.3f}")
+                initial_position[2] = initial_position[2] - manual_z_offset
+            self.toolhead.set_position(initial_position)
+            self.toolhead.wait_moves()
+            self.toolhead.flush_step_generation()
+            self.trigger_method = TriggerMethod.SCAN
+            self.previous_probe_success = 1
 
-                # Return relevant data
-                self.detect_threshold_z = original_threshold
+            # Return relevant data
+            self.detect_threshold_z = original_threshold
             return {
                 "samples": samples,
-                "max_deviation": deviation,
+                "standard_deviation": std_dev,
                 "final_position": initial_position,
                 "retries": retries,
                 "success": self.previous_probe_success,
             }
         except self.printer.command_error:
-            self.detect_threshold_z = original_threshold
             self.trigger_method = TriggerMethod.SCAN
             if hasattr(kinematics, "note_z_not_homed"):
                 kinematics.note_z_not_homed()
-            elif hasattr(kinematics, "clear_homing_state"):
-                kinematics.clear_homing_state("z")
             raise
 
     cmd_SCANNER_THRESHOLD_SCAN_help = "Scan THRESHOLD in TOUCH mode"
@@ -803,7 +802,7 @@ class Scanner:
         max_acceptable_retries = round(
             confirmation_retries * THRESHOLD_ACCEPTANCE_FACTOR
         )
-        max_acceptable_max_dev = vars["target"]
+        max_acceptable_std_dev = vars["target"]
 
         verbose = vars["verbose"]
 
@@ -816,7 +815,7 @@ class Scanner:
 
         # Ensure XY homing
         curtime = self.printer.get_reactor().monotonic()
-        kinematics = self.kinematics
+        kinematics = self.toolhead.get_kinematics()
         kin_status = kinematics.get_status(curtime)
         if (
             "x" not in kin_status["homed_axes"]
@@ -888,8 +887,8 @@ class Scanner:
                 if result["success"]:
                     # Check if this result meets "good" criteria
                     if result["retries"] <= max_acceptable_retries and (
-                        result["max_deviation"] is not None
-                        and result["max_deviation"] <= max_acceptable_max_dev
+                        result["standard_deviation"] is not None
+                        and result["standard_deviation"] <= max_acceptable_std_dev
                     ):
                         # Increase threshold_max by 3 steps above the current threshold, only if it hasn't been increased before
                         if not has_increased_threshold_max:
@@ -910,7 +909,8 @@ class Scanner:
                                 gcmd, touch_settings, verbose
                             )
                             if not repeat_result["success"] or (
-                                repeat_result["max_deviation"] > max_acceptable_max_dev
+                                repeat_result["standard_deviation"]
+                                > max_acceptable_std_dev
                             ):
                                 gcmd.respond_info(
                                     f"Qualify attempt {attempt + 1} failed for threshold {current_threshold}"
@@ -918,15 +918,15 @@ class Scanner:
                                 consistent_results = False
                                 break
                             gcmd.respond_info(
-                                f"Qualify attempt {attempt + 1} successful with max dev: {repeat_result['max_deviation']:.5f}"
+                                f"Qualify attempt {attempt + 1} successful with std dev: {repeat_result['standard_deviation']:.5f}"
                             )
 
                         # Save only successful repeat attempts in results
                         result["consistent_results"] = (
                             consistent_results  # Mark if it passed repeatability checks
                         )
-                        result["max_deviation"] = (
-                            repeat_result["max_deviation"]
+                        result["standard_deviation"] = (
+                            repeat_result["standard_deviation"]
                             if consistent_results
                             else None
                         )
@@ -957,13 +957,13 @@ class Scanner:
                 return  # Exit as there's no best threshold to save
 
             if consistent_results:
-                # Find the best consistent result based on minimum retries and max deviation
+                # Find the best consistent result based on minimum retries and standard deviation
                 best_result = min(
                     consistent_results,
                     key=lambda x: (
                         x["retries"],
-                        x["max_deviation"]
-                        if x["max_deviation"] is not None
+                        x["standard_deviation"]
+                        if x["standard_deviation"] is not None
                         else float("inf"),
                     ),
                 )
@@ -975,8 +975,8 @@ class Scanner:
                     results,
                     key=lambda x: (
                         x["retries"],
-                        x["max_deviation"]
-                        if x["max_deviation"] is not None
+                        x["standard_deviation"]
+                        if x["standard_deviation"] is not None
                         else float("inf"),
                     ),
                 )
@@ -987,21 +987,21 @@ class Scanner:
             self.detect_threshold_z = best_threshold
             self._save_threshold(best_threshold, vars["speed"])
 
-            # Handle None for max deviation by using a default message
-            max_dev_display = (
-                f"{best_result['max_deviation']:.5f}"
-                if best_result["max_deviation"] is not None
+            # Handle None for standard deviation by using a default message
+            std_dev_display = (
+                f"{best_result['standard_deviation']:.5f}"
+                if best_result["standard_deviation"] is not None
                 else "N/A"
             )
 
             # Inform the user about the result
             if optimal_found:
                 gcmd.respond_info(
-                    f"Optimal Threshold Determined: {best_threshold} with max deviation of {max_dev_display}"
+                    f"Optimal Threshold Determined: {best_threshold} with standard deviation of {std_dev_display}"
                 )
             else:
                 gcmd.respond_info(
-                    f"No fully optimal threshold found. Best attempt: {best_threshold} with max deviation of {max_dev_display}"
+                    f"No fully optimal threshold found. Best attempt: {best_threshold} with standard deviation of {std_dev_display}"
                 )
             gcmd.respond_info(
                 f"You can now {format_macro('SAVE_CONFIG')} to save your threshold."
@@ -1010,7 +1010,7 @@ class Scanner:
             self.trigger_method = TriggerMethod.SCAN
 
     def start_threshold_scan(self, gcmd: GCodeCommand, touch_settings, verbose: bool):
-        kinematics = self.kinematics
+        kinematics = self.toolhead.get_kinematics()
         initial_position = touch_settings.initial_position
         homing_position = touch_settings.homing_position
         accel = touch_settings.accel
@@ -1027,13 +1027,7 @@ class Scanner:
         try:
             self.detect_threshold_z = test_threshold
             # Set the initial position for the toolhead
-            try:
-                self.toolhead.set_position(initial_position, homing_axes=[2, "z"])
-            except Exception:
-                try:
-                    self.toolhead.set_position(initial_position, homing_axes="z")
-                except Exception:
-                    self.toolhead.set_position(initial_position, homing_axes=[2])
+            self.toolhead.set_position(initial_position, homing_axes=[2])
 
             retries = 0
             new_retry = False
@@ -1115,7 +1109,7 @@ class Scanner:
                     f"Deviation: {deviation:.4f}\nNew Average: {average:.4f}\nTolerance: {tolerance:.4f}",
                 )
 
-            max_dev = np.std(samples) if samples else None
+            std_dev = np.std(samples) if samples else None
             if len(samples) == num_samples:
                 success = True
                 position_difference = (
@@ -1128,7 +1122,7 @@ class Scanner:
                     f"Position Difference: {position_difference:.4f}\nAdjusted Difference: {adjusted_difference:.4f}",
                 )
             else:
-                max_dev = None
+                std_dev = None
                 success = False
 
             self.toolhead.wait_moves()
@@ -1138,7 +1132,7 @@ class Scanner:
             # Return relevant data
             return {
                 "samples": samples,
-                "max_deviation": max_dev,
+                "standard_deviation": std_dev,
                 "final_position": initial_position,
                 "retries": retries,
                 "success": success,
@@ -1148,15 +1142,13 @@ class Scanner:
             self.trigger_method = TriggerMethod.SCAN
             if hasattr(kinematics, "note_z_not_homed"):
                 kinematics.note_z_not_homed()
-            elif hasattr(kinematics, "clear_homing_state"):
-                kinematics.clear_homing_state("z")
             raise
 
     def touch_probe(self, speed: float, skip: int = 0, verbose: bool = True):
         skipped_msg = ""
         toolhead = self.printer.lookup_object("toolhead")
         curtime = self.printer.get_reactor().monotonic()
-        status = self.kinematics.get_status(curtime)
+        status = self.toolhead.get_kinematics().get_status(curtime)
         if "z" not in toolhead.get_status(curtime)["homed_axes"]:
             raise self.printer.command_error("Must home before probe")
         pos = toolhead.get_position()
@@ -1241,27 +1233,18 @@ class Scanner:
     def _zhop(self):
         if self.z_hop_dist != 0:
             curtime = self.printer.get_reactor().monotonic()
-            kin = self.kinematics
+            kin = self.toolhead.get_kinematics()
             kin_status = kin.get_status(curtime)
             pos = self.toolhead.get_position()
 
             move = [None, None, self.z_hop_dist]
             if "z" not in kin_status["homed_axes"]:
                 pos[2] = 0
-                try:
-                    self.toolhead.set_position(pos, homing_axes=[2, "z"])
-                except Exception:
-                    try:
-                        self.toolhead.set_position(pos, homing_axes="z")
-                    except Exception:
-                        self.toolhead.set_position(pos, homing_axes=[2])
-
+                self.toolhead.set_position(pos, homing_axes=[2])
                 self.toolhead.manual_move(move, self.z_hop_speed)
                 self.toolhead.wait_moves()
                 if hasattr(kin, "note_z_not_homed"):
                     kin.note_z_not_homed()
-                elif hasattr(kin, "clear_homing_state"):
-                    kin.clear_homing_state("z")
             elif pos[2] < self.z_hop_dist:
                 self.toolhead.manual_move(move, self.z_hop_speed)
                 self.toolhead.wait_moves()
@@ -1283,25 +1266,71 @@ class Scanner:
                     return temp[2] - pos[2]
 
                 self.mod_axis_twist_comp = get_z_compensation_value
-        # Ensure streaming mode is stopped
-        self.scanner_stream_cmd.send([0])
+        if not self._check_mcu_disconnected():
+            self.scanner_stream_cmd.send([0])
+        
+        self.model_temp = self.model_temp_builder.build_with_base(self)
+        if self.model_temp:
+            self.fmin = self.model_temp.fmin
+        self.model = self.models.get(self.default_model_name, None)
+        if self.model and not self._check_mcu_disconnected():
+            self._apply_threshold()
 
+    def _check_mcu_disconnected(self):
+        is_non_critical = hasattr(self._mcu, 'is_non_critical') and self._mcu.is_non_critical
+        is_disconnected = hasattr(self._mcu, 'non_critical_disconnected') and self._mcu.non_critical_disconnected
+        if is_non_critical and is_disconnected:
+            return True
+        return False
+
+    def _check_mcu_connected_or_raise(self):
+        is_disconnected = self._check_mcu_disconnected()
+        mcu_name = self._mcu.get_name() if hasattr(self._mcu, 'get_name') else 'scanner'
+        if is_disconnected:
+            raise self.printer.command_error(
+                "Scanner MCU '%s' is disconnected" % mcu_name
+            )
+
+    def _handle_mcu_disconnect(self):
+        if self._stream_en > 0:
+            self._stream_en = 0
+            self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
+            self._stream_flush()
+
+    def _handle_mcu_reconnect(self):
+        mcu_name = self._mcu.get_name() if hasattr(self._mcu, 'get_name') else 'unknown'
+        is_disconnected = self._mcu.non_critical_disconnected if hasattr(self._mcu, 'non_critical_disconnected') else 'N/A'
+        self.cmd_queue = self._mcu.alloc_command_queue()
+        self._build_config()
+        if hasattr(self.mcu_probe, '_reinit_after_reconnect'):
+            self.mcu_probe._reinit_after_reconnect()
+        
+        self._mcu.register_response(
+            self._handle_scanner_data, self.sensor.lower() + "_data"
+        )
+        
         self.model_temp = self.model_temp_builder.build_with_base(self)
         if self.model_temp:
             self.fmin = self.model_temp.fmin
         self.model = self.models.get(self.default_model_name, None)
         if self.model:
             self._apply_threshold()
+        
+        is_disconnected_after = self._mcu.non_critical_disconnected if hasattr(self._mcu, 'non_critical_disconnected') else 'N/A'
+
 
     def _handle_mcu_identify(self):
+        is_non_critical = hasattr(self._mcu, 'is_non_critical') and self._mcu.is_non_critical
+        is_disconnected = hasattr(self._mcu, 'non_critical_disconnected') and self._mcu.non_critical_disconnected
+        if is_non_critical and is_disconnected:
+            return
         try:
-            self._mcu_freq = self._mcu.get_constant_float("CLOCK_FREQ")
-            if self._mcu_freq < 20000000:
-                self.sensor_freq = self._mcu_freq
-            elif self._mcu_freq < 100000000:
-                self.sensor_freq = self._mcu_freq / 2
+            if self._mcu._mcu_freq < 20000000:
+                self.sensor_freq = self._mcu._mcu_freq
+            elif self._mcu._mcu_freq < 100000000:
+                self.sensor_freq = self._mcu._mcu_freq / 2
             else:
-                self.sensor_freq = self._mcu_freq / 6
+                self.sensor_freq = self._mcu._mcu_freq / 6
             self.inv_adc_max = 1.0 / self._mcu.get_constant_float("ADC_MAX")
             self.temp_smooth_count = self._mcu.get_constant_float(
                 self.sensor.upper() + "_ADC_SMOOTH_COUNT"
@@ -1310,7 +1339,6 @@ class Scanner:
             self.thermistor.setup_coefficients_beta(25.0, 47000.0, 4041.0)
 
             self.toolhead = self.printer.lookup_object("toolhead")
-            self.kinematics = self.toolhead.get_kinematics()
             self.trapq = self.toolhead.get_trapq()
             self.fw_version = self._mcu.get_status()["mcu_version"]
         except msgproto.error as e:
@@ -1319,6 +1347,9 @@ class Scanner:
             )
 
     def _build_config(self):
+        is_disconnected = hasattr(self._mcu, 'non_critical_disconnected') and self._mcu.non_critical_disconnected
+        if is_disconnected:
+            return
         self.scanner_stream_cmd = self._mcu.lookup_command(
             self.sensor.lower() + "_stream en=%u", cq=self.cmd_queue
         )
@@ -1436,7 +1467,7 @@ class Scanner:
 
     def _probing_move_to_probing_height(self, speed: float):
         curtime = self.reactor.monotonic()
-        status = self.kinematics.get_status(curtime)
+        status = self.toolhead.get_kinematics().get_status(curtime)
         pos = self.toolhead.get_position()
         pos[2] = status["axis_minimum"][2]
         try:
@@ -1516,20 +1547,13 @@ class Scanner:
             pos = self.toolhead.get_position()
             self.toolhead.wait_moves()
             curtime = self.printer.get_reactor().monotonic()
-            status = self.kinematics.get_status(curtime)
+            status = self.toolhead.get_kinematics().get_status(curtime)
             pos[2] = status["axis_maximum"][2]
-            try:
-                self.toolhead.set_position(pos, homing_axes=[2, "z"])
-            except Exception:
-                try:
-                    self.toolhead.set_position(pos, homing_axes="z")
-                except Exception:
-                    self.toolhead.set_position(pos, homing_axes=[2])
-
+            self.toolhead.set_position(pos, homing_axes=(0, 1, 2))
             self.touch_probe(self.probe_speed)
             self.toolhead.set_position(pos)
             self._move([None, None, 0], self.lift_speed)
-            kin = self.kinematics
+            kin = self.toolhead.get_kinematics()
             kin_spos = {
                 s.get_name(): s.get_commanded_position() for s in kin.get_steppers()
             }
@@ -1546,7 +1570,7 @@ class Scanner:
             self.trigger_method = TriggerMethod.SCAN
 
         elif gcmd.get("SKIP_MANUAL_PROBE", None) is not None:
-            kin = self.kinematics
+            kin = self.toolhead.get_kinematics()
             kin_spos = {
                 s.get_name(): s.get_commanded_position() for s in kin.get_steppers()
             }
@@ -1562,7 +1586,7 @@ class Scanner:
             )
         else:
             curtime = self.printer.get_reactor().monotonic()
-            kin_status = self.kinematics.get_status(curtime)
+            kin_status = self.toolhead.get_kinematics().get_status(curtime)
             if "xy" not in kin_status["homed_axes"]:
                 raise self.printer.command_error("Must home X and Y before calibration")
 
@@ -1583,13 +1607,7 @@ class Scanner:
                     - 2.0
                     - gcmd.get_float("CEIL", self.cal_config["ceil"])
                 )
-                try:
-                    self.toolhead.set_position(pos, homing_axes=[2, "z"])
-                except Exception:
-                    try:
-                        self.toolhead.set_position(pos, homing_axes="z")
-                    except Exception:
-                        self.toolhead.set_position(pos, homing_axes=[2])
+                self.toolhead.set_position(pos, homing_axes=[2])
                 forced_z = True
             self._move([touch_location_x, touch_location_y, None], 40)
             self.toolhead.wait_moves()
@@ -1619,11 +1637,9 @@ class Scanner:
             self.trigger_method = TriggerMethod.SCAN
             self._zhop()
             if forced_z:
-                kin = self.kinematics
+                kin = self.toolhead.get_kinematics()
                 if hasattr(kin, "note_z_not_homed"):
                     kin.note_z_not_homed()
-                elif hasattr(kin, "clear_homing_state"):
-                    kin.clear_homing_state("z")
             return
         gcmd.respond_info("Scanner calibration starting")
         cal_floor = gcmd.get_float("FLOOR", self.cal_config["floor"])
@@ -1735,6 +1751,9 @@ class Scanner:
         self.untrigger_freq = self.trigger_freq * (1 - self.trigger_hysteresis)
 
     def _apply_threshold(self, moving_up=False):
+        # Skip if MCU is disconnected
+        if self._check_mcu_disconnected():
+            return
         self._update_thresholds()
         trigger_c = int(self.freq_to_count(self.trigger_freq))
         untrigger_c = int(self.freq_to_count(self.untrigger_freq))
@@ -1755,6 +1774,9 @@ class Scanner:
         # Streaming mode
 
     def _check_hardware(self, sample):
+        # If non-critical MCU is disconnected, skip hardware checks
+        if self._check_mcu_disconnected():
+            return
         if not self.hardware_failure:
             msg = None
             if sample["data"] == 0xFFFFFFF:
@@ -1790,15 +1812,18 @@ class Scanner:
 
     def _enrich_sample(self, sample):
         sample["dist"] = self.freq_to_dist(sample["freq"], sample["temp"])
-        pos = self._get_position_by_time(sample["time"])  # pyright: ignore[reportUnknownArgumentType]
+        pos, vel = self._get_trapq_position(sample["time"])
 
-        if pos is None:  # pyright: ignore[reportUnnecessaryComparison]
+        if pos is None:
             return
         if sample["dist"] is not None and self.mod_axis_twist_comp is not None:
             sample["dist"] -= self.mod_axis_twist_comp(pos)
         sample["pos"] = pos
+        sample["vel"] = vel
 
     def _start_streaming(self):
+        # Raise error if MCU is disconnected - streaming requires active connection
+        self._check_mcu_connected_or_raise()
         if self._stream_en == 0:
             self.scanner_stream_cmd.send([1])
             curtime = self.reactor.monotonic()
@@ -1813,11 +1838,17 @@ class Scanner:
         self._stream_en -= 1
         if self._stream_en == 0:
             self.reactor.update_timer(self._stream_timeout_timer, self.reactor.NEVER)
-            self.scanner_stream_cmd.send([0])
+            # Only send stop command if MCU is connected
+            if not self._check_mcu_disconnected():
+                self.scanner_stream_cmd.send([0])
         self._stream_flush()
 
     def _stream_timeout(self, _: float):
         if not self._stream_en:
+            return self.reactor.NEVER
+        # If non-critical MCU is disconnected, don't shutdown - just stop streaming
+        if self._check_mcu_disconnected():
+            self._stream_en = 0
             return self.reactor.NEVER
         msg = "Scanner sensor not receiving data"
         logging.error(msg)
@@ -1923,16 +1954,24 @@ class Scanner:
         self._stream_buffer.append(params.copy())
         self._stream_flush_schedule()
 
-    def _get_position_by_time(self, print_time: float):
-        kin = self.kinematics
-        pos: dict[str, int] = {}
-        steppers = kin.get_steppers()
-        for stepper in steppers:
-            name = stepper.get_name()
-            mcu_pos = stepper.get_past_mcu_position(print_time)
-            cmd_pos = stepper.mcu_to_commanded_position(mcu_pos)
-            pos[name] = cmd_pos
-        return kin.calc_position(pos)
+    def _get_trapq_position(
+        self, print_time: float
+    ) -> "tuple[list[float] | None, float | None]":
+        ffi_main, ffi_lib = chelper.get_ffi()
+        data = ffi_main.new("struct pull_move[1]")
+        count = ffi_lib.trapq_extract_old(self.trapq, data, 1, 0.0, print_time)
+        if not count:
+            return None, None
+        move = data[0]
+        move_time = max(0.0, min(move.move_t, print_time - move.print_time))
+        dist = (move.start_v + 0.5 * move.accel * move_time) * move_time
+        pos = [
+            move.start_x + move.x_r * dist,
+            move.start_y + move.y_r * dist,
+            move.start_z + move.z_r * dist,
+        ]
+        velocity = move.start_v + move.accel * move_time
+        return pos, velocity
 
     def _sample_printtime_sync(self, skip=0, count=1):
         move_time = self.toolhead.get_last_move_time()
@@ -2156,11 +2195,11 @@ class Scanner:
                 f.close()
 
             completion_cb = close_file
-            _ = f.write("time,data,data_smooth,freq,dist,temp,pos_x,pos_y,pos_z\n")
+            f.write("time,data,data_smooth,freq,dist,temp,pos_x,pos_y,pos_z,vel\n")
 
             def cb(sample):
                 pos = sample.get("pos", None)
-                obj = "%.4f,%d,%.2f,%.5f,%.5f,%.2f,%s,%s,%s\n" % (
+                obj = "%.4f,%d,%.2f,%.5f,%.5f,%.2f,%s,%s,%s,%s\n" % (
                     sample["time"],
                     sample["data"],
                     sample["data_smooth"],
@@ -2170,6 +2209,7 @@ class Scanner:
                     "%.3f" % (pos[0],) if pos is not None else "",
                     "%.3f" % (pos[1],) if pos is not None else "",
                     "%.3f" % (pos[2],) if pos is not None else "",
+                    "%.3f" % (sample["vel"],) if "vel" in sample else "",
                 )
                 f.write(obj)
 
@@ -2817,7 +2857,7 @@ class APIDumpHelper:
         self.clients = {}
         self.stream = None
         self.buffer = []
-        self.fields = ["dist", "temp", "pos", "freq", "time"]
+        self.fields = ["dist", "temp", "pos", "freq", "vel", "time"]
 
     def _start_stop(self):
         if not self.stream and self.clients:
@@ -2955,7 +2995,24 @@ class ScannerEndstopWrapper:
         self.z_homed = False
         self.is_homing = False
 
+    def _reinit_after_reconnect(self):
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self._trdispatch = ffi_main.gc(ffi_lib.trdispatch_alloc(), ffi_lib.free)        
+        for ts in self._trsyncs:
+            mcu = ts.get_mcu()
+            mcu_name = mcu.get_name()
+            ts._trdispatch = self._trdispatch
+            set_timeout_tag = mcu.lookup_command_tag("trsync_set_timeout oid=%c clock=%u")
+            trigger_tag = mcu.lookup_command_tag("trsync_trigger oid=%c reason=%c")
+            state_tag = mcu.lookup_command_tag("trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u")
+            ts._trdispatch_mcu = ffi_main.gc(ffi_lib.trdispatch_mcu_alloc(
+                self._trdispatch, mcu._serial.serialqueue,
+                ts._cmd_queue, ts._oid, set_timeout_tag, trigger_tag, state_tag), ffi_lib.free)
+
     def _handle_mcu_identify(self):
+        is_disconnected = hasattr(self._mcu, 'non_critical_disconnected') and self._mcu.non_critical_disconnected
+        if is_disconnected:
+            return
         self.toolhead = self.scanner.printer.lookup_object("toolhead")
         kin = self.toolhead.get_kinematics()
         for stepper in kin.get_steppers():
@@ -2964,6 +3021,14 @@ class ScannerEndstopWrapper:
 
     def _handle_home_rails_begin(self, homing_state, rails):
         self.is_homing = False
+        # Check if Z axis is being homed and scanner is disconnected
+        # This check happens BEFORE set_position is called in homing.py
+        z_in_rails = any(rail.get_name() == 'stepper_z' for rail in rails)
+        if z_in_rails and self.scanner._check_mcu_disconnected():
+            raise self.scanner.printer.command_error(
+                "Scanner MCU '%s' is disconnected - cannot home Z axis" % 
+                (self._mcu.get_name() if hasattr(self._mcu, 'get_name') else 'scanner')
+            )
 
     def _handle_home_rails_end(self, homing_state, rails):
         if (
@@ -3034,6 +3099,8 @@ class ScannerEndstopWrapper:
     def home_start(
         self, print_time, sample_time, sample_count, rest_time, triggered=True
     ):
+        # Check if MCU is disconnected before starting homing
+        self.scanner._check_mcu_connected_or_raise()
         if self.scanner.model is not None:
             self.scanner.model.validate()
         if (
@@ -3086,7 +3153,9 @@ class ScannerEndstopWrapper:
         if self._mcu.is_fileoutput():
             self._trigger_completion.complete(True)
         _ = self._trigger_completion.wait()
-        self.scanner.scanner_stop_home.send()
+        # Only send stop command if MCU is connected
+        if not self.scanner._check_mcu_disconnected():
+            self.scanner.scanner_stop_home.send()
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_stop(self._trdispatch)
         res = [trsync.stop() for trsync in self._trsyncs]
@@ -3101,6 +3170,9 @@ class ScannerEndstopWrapper:
         return home_end_time
 
     def query_endstop(self, print_time):
+        # If MCU is disconnected, report as not triggered (safe state)
+        if self.scanner._check_mcu_disconnected():
+            return 1
         if self.scanner.model is None:
             return 1
         sample = self.scanner._sample_async()
@@ -3222,6 +3294,9 @@ class ScannerMeshHelper:
         self.exclude_object = self.scanner.printer.lookup_object("exclude_object", None)
 
     def _handle_mcu_identify(self):
+        # Skip if non-critical MCU is disconnected
+        if hasattr(self.scanner._mcu, 'non_critical_disconnected') and self.scanner._mcu.non_critical_disconnected:
+            return
         # Auto determine a safe overscan amount
         toolhead = self.scanner.printer.lookup_object("toolhead")
         curtime = self.scanner.reactor.monotonic()
@@ -3485,7 +3560,7 @@ class ScannerMeshHelper:
             p = path if i % 2 == 0 else reversed(path)
             for x, y in p:
                 self.toolhead.manual_move([x, y, None], speed)
-            self.toolhead.dwell(0.251)
+        self.toolhead.dwell(0.251)
         self.toolhead.wait_moves()
 
     def _collect_zero_ref(self, speed, coord):
